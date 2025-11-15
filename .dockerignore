@@ -1,0 +1,15 @@
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+*.md
+mic_test.py
+app.py
+*.tar.gz
+SpeechCommands/
+speech_command_model.pth
+test_api.py

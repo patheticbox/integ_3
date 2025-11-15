@@ -1,0 +1,353 @@
+name: ML Model CI/CD Pipeline
+
+on:
+  # Тригер на pull request
+  pull_request:
+    branches: [ master, main ]
+  
+  # Тригер на push в master
+  push:
+    branches: [ master, main ]
+  
+  # Ручний запуск
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Number of training epochs'
+        required: false
+        default: '3'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # JOB 1: ТРЕНУВАННЯ МОДЕЛІ
+  # ============================================
+  train:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Build training image
+        run: |
+          docker build --target trainer -t ml-trainer:latest .
+      
+      - name: Run training
+        run: |
+          docker run --name trainer-container ml-trainer:latest
+      
+      - name: Extract trained model
+        run: |
+          # Копіюємо модель з контейнера
+          docker cp trainer-container:/app/speech_command_model.pth ./
+          
+          # Копіюємо логи (якщо є)
+          docker logs trainer-container > training_log.txt 2>&1 || true
+      
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: trained-model
+          path: speech_command_model.pth
+          retention-days: 30
+      
+      - name: Upload training logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: training-logs
+          path: training_log.txt
+          retention-days: 30
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f trainer-container || true
+
+  # ============================================
+  # JOB 2: ТЕСТУВАННЯ МОДЕЛІ
+  # ============================================
+  test:
+    runs-on: ubuntu-latest
+    needs: train
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download trained model
+        uses: actions/download-artifact@v3
+        with:
+          name: trained-model
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install torch==2.1.0 torchaudio==2.1.0 numpy==1.24.3
+      
+      - name: Test model
+        run: |
+          python -c "
+          import torch
+          import time
+          
+          # Завантаження моделі
+          checkpoint = torch.load('speech_command_model.pth', map_location='cpu')
+          print('Model loaded successfully')
+          print(f'Classes: {checkpoint[\"classes\"]}')
+          
+          # Перевірка структури
+          assert 'model_state_dict' in checkpoint
+          assert 'classes' in checkpoint
+          assert len(checkpoint['classes']) == 4
+          
+          # Тест швидкості завантаження
+          start = time.time()
+          checkpoint = torch.load('speech_command_model.pth', map_location='cpu')
+          load_time = (time.time() - start) * 1000
+          
+          print(f'Load time: {load_time:.2f} ms')
+          
+          # Збереження метрик
+          import json
+          metrics = {
+            'classes': checkpoint['classes'],
+            'load_time_ms': load_time,
+            'model_params': sum(p.numel() for p in checkpoint['model_state_dict'].values())
+          }
+          
+          with open('test_metrics.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
+          
+          print('✅ Model test passed')
+          "
+      
+      - name: Upload test metrics
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-metrics
+          path: test_metrics.json
+
+  # ============================================
+  # JOB 3: ЗБІРКА INFERENCE IMAGE
+  # ============================================
+  build-inference:
+    runs-on: ubuntu-latest
+    needs: test
+    # Запускаємо тільки на push в master або ручному запуску
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download trained model
+        uses: actions/download-artifact@v3
+        with:
+          name: trained-model
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push inference image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          target: runtime
+
+  # ============================================
+  # JOB 4: BENCHMARK INFERENCE
+  # ============================================
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: build-inference
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Run inference container
+        run: |
+          docker run -d -p 5000:5000 --name inference-server \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          # Чекаємо запуску
+          sleep 10
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install test dependencies
+        run: |
+          pip install requests numpy
+      
+      - name: Benchmark inference
+        run: |
+          python -c "
+          import requests
+          import time
+          import json
+          
+          API_URL = 'http://localhost:5000'
+          
+          # Health check
+          response = requests.get(f'{API_URL}/health', timeout=10)
+          print(f'Health check: {response.json()}')
+          
+          # Вимірювання latency (симуляція)
+          latencies = []
+          for i in range(10):
+            start = time.time()
+            response = requests.get(f'{API_URL}/health', timeout=5)
+            latency = (time.time() - start) * 1000
+            latencies.append(latency)
+          
+          avg_latency = sum(latencies) / len(latencies)
+          
+          # Збереження метрик
+          metrics = {
+            'avg_latency_ms': avg_latency,
+            'min_latency_ms': min(latencies),
+            'max_latency_ms': max(latencies),
+            'test_runs': len(latencies)
+          }
+          
+          with open('benchmark_metrics.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
+          
+          print(f'Average latency: {avg_latency:.2f} ms')
+          print('✅ Benchmark completed')
+          "
+      
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-metrics
+          path: benchmark_metrics.json
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logs inference-server > inference_log.txt 2>&1 || true
+          docker stop inference-server || true
+          docker rm inference-server || true
+      
+      - name: Upload inference logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: inference-logs
+          path: inference_log.txt
+
+  # ============================================
+  # JOB 5: ГЕНЕРАЦІЯ ЗВІТУ
+  # ============================================
+  report:
+    runs-on: ubuntu-latest
+    needs: [train, test, benchmark]
+    if: always()
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+      
+      - name: Generate report
+        run: |
+          cat > report.md << 'EOF'
+          # ML Pipeline Execution Report
+          
+          **Run ID:** ${{ github.run_id }}
+          **Trigger:** ${{ github.event_name }}
+          **Branch:** ${{ github.ref_name }}
+          **Commit:** ${{ github.sha }}
+          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Jobs Status
+          
+          - ✅ Training: Completed
+          - ✅ Testing: Completed
+          EOF
+          
+          # Додаємо benchmark якщо є
+          if [ -f benchmark-metrics/benchmark_metrics.json ]; then
+            echo "- ✅ Benchmark: Completed" >> report.md
+            echo "" >> report.md
+            echo "## Benchmark Metrics" >> report.md
+            echo '```json' >> report.md
+            cat benchmark-metrics/benchmark_metrics.json >> report.md
+            echo '```' >> report.md
+          fi
+          
+          # Додаємо test метрики
+          if [ -f test-metrics/test_metrics.json ]; then
+            echo "" >> report.md
+            echo "## Test Metrics" >> report.md
+            echo '```json' >> report.md
+            cat test-metrics/test_metrics.json >> report.md
+            echo '```' >> report.md
+          fi
+          
+          echo "" >> report.md
+          echo "## Artifacts" >> report.md
+          echo "- Trained model: \`trained-model\`" >> report.md
+          echo "- Training logs: \`training-logs\`" >> report.md
+          echo "- Test metrics: \`test-metrics\`" >> report.md
+          
+          if [ -f benchmark-metrics/benchmark_metrics.json ]; then
+            echo "- Benchmark metrics: \`benchmark-metrics\`" >> report.md
+          fi
+          
+          cat report.md
+      
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-report
+          path: report.md

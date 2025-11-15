@@ -1,0 +1,6 @@
+SpeechCommands/
+*.pth
+*.tar.gz
+venv/
+env/
+__pycache__/
